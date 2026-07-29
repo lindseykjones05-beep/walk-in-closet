@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+
+# Personal wardrobe data
+closet.db
+images/
+inspiration_images/
+wishlist_images/
+background_images/
