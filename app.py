@@ -1,6 +1,4 @@
 import os
-import sqlite3
-import base64
 import uuid
 import json
 from datetime import date
@@ -9,6 +7,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import streamlit as st
+from supabase import create_client, Client
 
 
 # --------------------------------------------------
@@ -20,6 +19,99 @@ st.set_page_config(
     page_icon="W",
     layout="wide"
 )
+
+def create_supabase_client() -> Client:
+    return create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["key"],
+    )
+
+
+if "supabase" not in st.session_state:
+    st.session_state["supabase"] = create_supabase_client()
+
+supabase = st.session_state["supabase"]
+
+def show_auth_page():
+    st.title("Walk In Closet")
+    st.caption("Sign in to access your private digital wardrobe.")
+
+    sign_in_tab, sign_up_tab = st.tabs(
+        ["Sign In", "Create Account"]
+    )
+
+    with sign_in_tab:
+        with st.form("sign_in_form"):
+            email = st.text_input("Email", key="sign_in_email")
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="sign_in_password",
+            )
+
+            sign_in_submitted = st.form_submit_button(
+                "Sign In",
+                use_container_width=True,
+            )
+
+        if sign_in_submitted:
+            try:
+                response = supabase.auth.sign_in_with_password(
+                    {
+                        "email": email.strip(),
+                        "password": password,
+                    }
+                )
+
+                st.session_state["user"] = response.user
+                st.success("Signed in successfully.")
+                st.rerun()
+
+            except Exception as error:
+                st.error(f"Could not sign in: {error}")
+
+    with sign_up_tab:
+        with st.form("sign_up_form"):
+            new_email = st.text_input(
+                "Email",
+                key="sign_up_email",
+            )
+            new_password = st.text_input(
+                "Password",
+                type="password",
+                key="sign_up_password",
+            )
+
+            sign_up_submitted = st.form_submit_button(
+                "Create Account",
+                use_container_width=True,
+            )
+
+        if sign_up_submitted:
+            try:
+                response = supabase.auth.sign_up(
+                    {
+                        "email": new_email.strip(),
+                        "password": new_password,
+                    }
+                )
+
+                if response.session:
+                    st.session_state["user"] = response.user
+                    st.success("Account created.")
+                    st.rerun()
+                else:
+                    st.success(
+                        "Account created. Check your email to confirm it, then sign in."
+                    )
+
+            except Exception as error:
+                st.error(f"Could not create account: {error}")
+
+if "user" not in st.session_state:
+    show_auth_page()
+    st.stop()
+
 
 # --------------------------------------------------
 # WALK IN CLOSET DESIGN SYSTEM
@@ -325,602 +417,349 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-IMAGE_FOLDER = Path("images")
-INSPIRATION_FOLDER = Path("inspiration_images")
-BACKGROUND_FOLDER = Path("background_images")
-DATABASE_FILE = "closet.db"
-WISHLIST_FOLDER = Path("wishlist_images")
-
-DATABASE_FILE = "closet.db"
-
-IMAGE_FOLDER.mkdir(exist_ok=True)
-INSPIRATION_FOLDER.mkdir(exist_ok=True)
-BACKGROUND_FOLDER.mkdir(exist_ok=True)
-WISHLIST_FOLDER.mkdir(exist_ok=True)
+STORAGE_BUCKET = "closet-images"
 
 
-# --------------------------------------------------
-# DATABASE FUNCTIONS
-# --------------------------------------------------
-
-def connect_to_database():
-    return sqlite3.connect(DATABASE_FILE)
+def current_user_id():
+    """Return the signed-in Supabase user ID."""
+    return str(st.session_state["user"].id)
 
 
-def create_clothing_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
+def _rows(response):
+    """Return response data as a list, even when Supabase returns None."""
+    return response.data or []
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS clothing (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT NOT NULL,
-            category TEXT NOT NULL,
-            color TEXT,
-            season TEXT,
-            favorite INTEGER,
-            photo_path TEXT
-        )
-        """
+
+def _upload_to_storage(uploaded_file, folder):
+    if uploaded_file is None:
+        return None
+
+    extension = Path(uploaded_file.name).suffix.lower() or ".jpg"
+    storage_path = (
+        f"{current_user_id()}/{folder}/"
+        f"{uuid.uuid4().hex}{extension}"
     )
 
-    connection.commit()
-    connection.close()
+    file_options = {
+        "content-type": uploaded_file.type or "application/octet-stream",
+        "upsert": "false",
+    }
 
-
-def add_clothing_item(
-    item_name,
-    category,
-    color,
-    season,
-    favorite,
-    photo_path
-):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO clothing (
-            item_name,
-            category,
-            color,
-            season,
-            favorite,
-            photo_path
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            item_name,
-            category,
-            color,
-            season,
-            int(favorite),
-            photo_path
-        )
+    supabase.storage.from_(STORAGE_BUCKET).upload(
+        storage_path,
+        uploaded_file.getvalue(),
+        file_options,
     )
-
-    connection.commit()
-    connection.close()
+    return storage_path
 
 
-def get_clothing_items():
-    connection = connect_to_database()
-    cursor = connection.cursor()
+def _delete_storage_file(storage_path):
+    if not storage_path:
+        return
+    try:
+        supabase.storage.from_(STORAGE_BUCKET).remove([storage_path])
+    except Exception:
+        # A missing image should not prevent its database row from being deleted.
+        pass
 
-    cursor.execute(
-        """
-        SELECT
-            id,
-            item_name,
-            category,
-            color,
-            season,
-            favorite,
-            photo_path
-        FROM clothing
-        ORDER BY id DESC
-        """
-    )
 
-    clothing_items = cursor.fetchall()
+def get_image_source(storage_path):
+    """Create a temporary URL for an image stored in the private bucket."""
+    if not storage_path:
+        return None
 
-    connection.close()
+    try:
+        response = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(
+            storage_path,
+            3600,
+        )
+        if isinstance(response, dict):
+            return (
+                response.get("signedURL")
+                or response.get("signedUrl")
+                or response.get("signed_url")
+            )
+        data = getattr(response, "data", None)
+        if isinstance(data, dict):
+            return (
+                data.get("signedURL")
+                or data.get("signedUrl")
+                or data.get("signed_url")
+            )
+    except Exception:
+        return None
 
-    return clothing_items
+    return None
 
 
 def save_uploaded_photo(photo):
-    if photo is None:
-        return None
-
-    safe_filename = photo.name.replace(" ", "_")
-    photo_path = IMAGE_FOLDER / safe_filename
-
-    with open(photo_path, "wb") as image_file:
-        image_file.write(photo.getbuffer())
-
-    return str(photo_path)
-
-
-def create_inspiration_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inspiration (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            board_name TEXT,
-            notes TEXT,
-            image_path TEXT NOT NULL
-        )
-        """
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def add_inspiration_pin(title, board_name, notes, image_path):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO inspiration (
-            title,
-            board_name,
-            notes,
-            image_path
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            title,
-            board_name,
-            notes,
-            image_path
-        )
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def get_inspiration_pins():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            id,
-            title,
-            board_name,
-            notes,
-            image_path
-        FROM inspiration
-        ORDER BY id DESC
-        """
-    )
-
-    pins = cursor.fetchall()
-    connection.close()
-
-    return pins
-
-
-def delete_inspiration_pin(pin_id):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT image_path
-        FROM inspiration
-        WHERE id = ?
-        """,
-        (pin_id,)
-    )
-
-    result = cursor.fetchone()
-
-    cursor.execute(
-        """
-        DELETE FROM inspiration
-        WHERE id = ?
-        """,
-        (pin_id,)
-    )
-
-    connection.commit()
-    connection.close()
-
-    if result:
-        image_path = result[0]
-
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
+    return _upload_to_storage(photo, "clothing")
 
 
 def save_inspiration_image(uploaded_image):
-    if uploaded_image is None:
-        return None
+    return _upload_to_storage(uploaded_image, "inspiration")
 
-    file_extension = Path(uploaded_image.name).suffix.lower()
-    unique_filename = f"{uuid.uuid4()}{file_extension}"
-    image_path = INSPIRATION_FOLDER / unique_filename
 
-    with open(image_path, "wb") as image_file:
-        image_file.write(uploaded_image.getbuffer())
+def save_wishlist_image(uploaded_image):
+    return _upload_to_storage(uploaded_image, "wishlist")
 
-    return str(image_path)
 
-def create_outfits_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS outfits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            outfit_name TEXT NOT NULL,
-            occasion TEXT,
-            notes TEXT
-        )
-        """
+def save_background_image(uploaded_file, page_name):
+    safe_page_name = (
+        page_name.lower().replace(" ", "_")
+        .replace("🏠", "").replace("➕", "")
+        .replace("👚", "").replace("👗", "")
+        .replace("📌", "").replace("📅", "")
+        .replace("❤️", "").replace("🎨", "")
+        .strip("_")
     )
+    return _upload_to_storage(uploaded_file, f"backgrounds/{safe_page_name}")
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS outfit_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            outfit_id INTEGER NOT NULL,
-            clothing_id INTEGER NOT NULL,
-            FOREIGN KEY (outfit_id) REFERENCES outfits(id),
-            FOREIGN KEY (clothing_id) REFERENCES clothing(id)
-        )
-        """
+
+def add_clothing_item(item_name, category, color, season, favorite, photo_path):
+    supabase.table("clothing").insert({
+        "user_id": current_user_id(),
+        "item_name": item_name,
+        "category": category,
+        "color": color,
+        "season": season,
+        "favorite": bool(favorite),
+        "photo_path": photo_path,
+    }).execute()
+
+
+def get_clothing_items():
+    rows = _rows(
+        supabase.table("clothing")
+        .select("id,item_name,category,color,season,favorite,photo_path")
+        .eq("user_id", current_user_id())
+        .order("id", desc=True)
+        .execute()
     )
-def add_outfit(
-    outfit_name,
-    occasion,
-    notes,
-    clothing_ids
-):
-    connection = connect_to_database()
+    return [(
+        row["id"], row["item_name"], row["category"], row.get("color"),
+        row.get("season"), int(bool(row.get("favorite"))), row.get("photo_path")
+    ) for row in rows]
 
-    try:
-        cursor = connection.cursor()
 
-        cursor.execute(
-            """
-            INSERT INTO outfits (
-                outfit_name,
-                occasion,
-                notes
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                outfit_name,
-                occasion,
-                notes,
-            )
-        )
+def add_inspiration_pin(title, board_name, notes, image_path):
+    supabase.table("inspiration").insert({
+        "user_id": current_user_id(),
+        "title": title,
+        "board_name": board_name,
+        "notes": notes,
+        "image_path": image_path,
+    }).execute()
 
-        outfit_id = cursor.lastrowid
 
-        for clothing_id in clothing_ids:
-            cursor.execute(
-                """
-                INSERT INTO outfit_items (
-                    outfit_id,
-                    clothing_id
-                )
-                VALUES (?, ?)
-                """,
-                (
-                    outfit_id,
-                    clothing_id,
-                )
-            )
+def get_inspiration_pins():
+    rows = _rows(
+        supabase.table("inspiration")
+        .select("id,title,board_name,notes,image_path")
+        .eq("user_id", current_user_id())
+        .order("id", desc=True)
+        .execute()
+    )
+    return [(
+        row["id"], row["title"], row.get("board_name"),
+        row.get("notes"), row.get("image_path")
+    ) for row in rows]
 
-        connection.commit()
 
-        return outfit_id
+def delete_inspiration_pin(pin_id):
+    existing = _rows(
+        supabase.table("inspiration")
+        .select("image_path")
+        .eq("id", pin_id)
+        .eq("user_id", current_user_id())
+        .execute()
+    )
+    supabase.table("inspiration").delete().eq("id", pin_id).eq(
+        "user_id", current_user_id()
+    ).execute()
+    if existing:
+        _delete_storage_file(existing[0].get("image_path"))
 
-    except Exception:
-        connection.rollback()
-        raise
 
-    finally:
-        connection.close()
+def add_outfit(outfit_name, occasion, notes, clothing_ids):
+    response = supabase.table("outfits").insert({
+        "user_id": current_user_id(),
+        "outfit_name": outfit_name,
+        "occasion": occasion,
+        "notes": notes,
+    }).execute()
+    outfit_id = response.data[0]["id"]
+
+    if clothing_ids:
+        supabase.table("outfit_items").insert([
+            {
+                "user_id": current_user_id(),
+                "outfit_id": outfit_id,
+                "clothing_id": clothing_id,
+            }
+            for clothing_id in clothing_ids
+        ]).execute()
+    return outfit_id
+
+
 def get_saved_outfits():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            id,
-            outfit_name,
-            occasion,
-            notes
-        FROM outfits
-        ORDER BY id DESC
-        """
+    rows = _rows(
+        supabase.table("outfits")
+        .select("id,outfit_name,occasion,notes")
+        .eq("user_id", current_user_id())
+        .order("id", desc=True)
+        .execute()
     )
+    return [(
+        row["id"], row["outfit_name"], row.get("occasion"), row.get("notes")
+    ) for row in rows]
 
-    outfits = cursor.fetchall()
-
-    connection.close()
-
-    return outfits
 
 def get_outfit_items(outfit_id):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            clothing.id,
-            clothing.item_name,
-            clothing.category,
-            clothing.color,
-            clothing.season,
-            clothing.favorite,
-            clothing.photo_path
-        FROM clothing
-        JOIN outfit_items
-            ON clothing.id = outfit_items.clothing_id
-        WHERE outfit_items.outfit_id = ?
-        """,
-        (outfit_id,)
+    links = _rows(
+        supabase.table("outfit_items")
+        .select("clothing_id")
+        .eq("outfit_id", outfit_id)
+        .eq("user_id", current_user_id())
+        .execute()
     )
+    clothing_ids = [row["clothing_id"] for row in links]
+    if not clothing_ids:
+        return []
 
-    items = cursor.fetchall()
-
-    connection.close()
-
-    return items
-
-    connection.commit()
-    connection.close()
-
-    connection.commit()
-    connection.close()
-
-
-def create_outfit_calendar_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS outfit_calendar (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            outfit_id INTEGER NOT NULL,
-            wear_date TEXT NOT NULL,
-            event_name TEXT,
-            notes TEXT,
-            FOREIGN KEY (outfit_id) REFERENCES outfits(id)
-        )
-        """
+    rows = _rows(
+        supabase.table("clothing")
+        .select("id,item_name,category,color,season,favorite,photo_path")
+        .eq("user_id", current_user_id())
+        .in_("id", clothing_ids)
+        .execute()
     )
+    by_id = {row["id"]: row for row in rows}
+    ordered = [by_id[item_id] for item_id in clothing_ids if item_id in by_id]
+    return [(
+        row["id"], row["item_name"], row["category"], row.get("color"),
+        row.get("season"), int(bool(row.get("favorite"))), row.get("photo_path")
+    ) for row in ordered]
 
-    connection.commit()
-    connection.close()
+
+def add_outfit_to_calendar(outfit_id, wear_date, event_name, notes):
+    supabase.table("outfit_calendar").insert({
+        "user_id": current_user_id(),
+        "outfit_id": outfit_id,
+        "wear_date": str(wear_date),
+        "event_name": event_name,
+        "notes": notes,
+    }).execute()
+
+
+def _calendar_rows(query):
+    entries = _rows(query.execute())
+    outfit_ids = list({row["outfit_id"] for row in entries})
+    if not outfit_ids:
+        return []
+
+    outfits = _rows(
+        supabase.table("outfits")
+        .select("id,outfit_name,occasion")
+        .eq("user_id", current_user_id())
+        .in_("id", outfit_ids)
+        .execute()
+    )
+    outfit_map = {row["id"]: row for row in outfits}
+    result = []
+    for entry in entries:
+        outfit = outfit_map.get(entry["outfit_id"])
+        if outfit:
+            result.append((
+                entry["id"], str(entry["wear_date"]), entry.get("event_name"),
+                entry.get("notes"), outfit["id"], outfit["outfit_name"],
+                outfit.get("occasion"),
+            ))
+    return result
 
 
 def get_calendar_outfits_between(start_date, end_date):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            outfit_calendar.id,
-            outfit_calendar.wear_date,
-            outfit_calendar.event_name,
-            outfit_calendar.notes,
-            outfits.id,
-            outfits.outfit_name,
-            outfits.occasion
-        FROM outfit_calendar
-        JOIN outfits
-            ON outfit_calendar.outfit_id = outfits.id
-        WHERE outfit_calendar.wear_date BETWEEN ? AND ?
-        ORDER BY outfit_calendar.wear_date ASC
-        """,
-        (
-            start_date,
-            end_date,
-        )
+    query = (
+        supabase.table("outfit_calendar")
+        .select("id,outfit_id,wear_date,event_name,notes")
+        .eq("user_id", current_user_id())
+        .gte("wear_date", str(start_date))
+        .lte("wear_date", str(end_date))
+        .order("wear_date")
     )
+    return _calendar_rows(query)
 
-    calendar_outfits = cursor.fetchall()
 
-    connection.close()
-
-    return calendar_outfits
-
-def create_wishlist_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS wishlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT NOT NULL,
-            category TEXT,
-            color TEXT,
-            store_name TEXT,
-            price REAL,
-            item_link TEXT,
-            priority TEXT,
-            notes TEXT,
-            image_path TEXT,
-            purchased INTEGER DEFAULT 0
-        )
-        """
+def get_calendar_outfits():
+    query = (
+        supabase.table("outfit_calendar")
+        .select("id,outfit_id,wear_date,event_name,notes")
+        .eq("user_id", current_user_id())
+        .order("wear_date")
     )
+    return _calendar_rows(query)
 
-    connection.commit()
-    connection.close()
-def save_wishlist_image(uploaded_image):
-    if uploaded_image is None:
-        return None
 
-    file_extension = Path(uploaded_image.name).suffix.lower()
+def delete_calendar_outfit(calendar_id):
+    supabase.table("outfit_calendar").delete().eq("id", calendar_id).eq(
+        "user_id", current_user_id()
+    ).execute()
 
-    unique_filename = (
-        f"{uuid.uuid4().hex}{file_extension}"
-    )
-
-    image_path = WISHLIST_FOLDER / unique_filename
-
-    with open(image_path, "wb") as image_file:
-        image_file.write(
-            uploaded_image.getbuffer()
-        )
-
-    return str(image_path)
 
 def add_wishlist_item(
-    item_name,
-    category,
-    color,
-    store_name,
-    price,
-    item_link,
-    priority,
-    notes,
-    image_path
+    item_name, category, color, store_name, price, item_link,
+    priority, notes, image_path
 ):
-    connection = connect_to_database()
-    cursor = connection.cursor()
+    supabase.table("wishlist").insert({
+        "user_id": current_user_id(),
+        "item_name": item_name,
+        "category": category,
+        "color": color,
+        "store_name": store_name,
+        "price": price,
+        "item_link": item_link,
+        "priority": priority,
+        "notes": notes,
+        "image_path": image_path,
+        "purchased": False,
+    }).execute()
 
-    cursor.execute(
-        """
-        INSERT INTO wishlist (
-            item_name,
-            category,
-            color,
-            store_name,
-            price,
-            item_link,
-            priority,
-            notes,
-            image_path,
-            purchased
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """,
-        (
-            item_name,
-            category,
-            color,
-            store_name,
-            price,
-            item_link,
-            priority,
-            notes,
-            image_path,
-        )
-    )
-
-    connection.commit()
-    connection.close()
 
 def get_wishlist_items():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            id,
-            item_name,
-            category,
-            color,
-            store_name,
-            price,
-            item_link,
-            priority,
-            notes,
-            image_path,
-            purchased
-        FROM wishlist
-        ORDER BY id DESC
-        """
+    rows = _rows(
+        supabase.table("wishlist")
+        .select("id,item_name,category,color,store_name,price,item_link,priority,notes,image_path,purchased")
+        .eq("user_id", current_user_id())
+        .order("id", desc=True)
+        .execute()
     )
+    return [(
+        row["id"], row["item_name"], row.get("category"), row.get("color"),
+        row.get("store_name"), row.get("price"), row.get("item_link"),
+        row.get("priority"), row.get("notes"), row.get("image_path"),
+        int(bool(row.get("purchased"))),
+    ) for row in rows]
 
-    wishlist_items = cursor.fetchall()
 
-    connection.close()
+def update_wishlist_purchase_status(wishlist_id, purchased):
+    supabase.table("wishlist").update({"purchased": bool(purchased)}).eq(
+        "id", wishlist_id
+    ).eq("user_id", current_user_id()).execute()
 
-    return wishlist_items
-
-def update_wishlist_purchase_status(
-    wishlist_id,
-    purchased
-):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        UPDATE wishlist
-        SET purchased = ?
-        WHERE id = ?
-        """,
-        (
-            int(purchased),
-            wishlist_id,
-        )
-    )
-
-    connection.commit()
-    connection.close()
 
 def delete_wishlist_item(wishlist_id):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT image_path
-        FROM wishlist
-        WHERE id = ?
-        """,
-        (wishlist_id,)
+    existing = _rows(
+        supabase.table("wishlist")
+        .select("image_path")
+        .eq("id", wishlist_id)
+        .eq("user_id", current_user_id())
+        .execute()
     )
-
-    result = cursor.fetchone()
-
-    cursor.execute(
-        """
-        DELETE FROM wishlist
-        WHERE id = ?
-        """,
-        (wishlist_id,)
-    )
-
-    connection.commit()
-    connection.close()
-
-    if result:
-        image_path = result[0]
-
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
+    supabase.table("wishlist").delete().eq("id", wishlist_id).eq(
+        "user_id", current_user_id()
+    ).execute()
+    if existing:
+        _delete_storage_file(existing[0].get("image_path"))
 
 # --------------------------------------------------
 # DESIGN COMPONENTS
@@ -962,9 +801,9 @@ def render_clothing_card(item, location="closet"):
         key=f"closet-card-{location}-{item_id}"
     ):
 
-        if photo_path and os.path.exists(photo_path):
+        if get_image_source(photo_path):
             st.image(
-                photo_path,
+                get_image_source(photo_path),
                 use_container_width=True,
             )
         else:
@@ -1017,9 +856,9 @@ def render_wishlist_card(item):
         key=f"closet-card-wishlist-{wishlist_id}"
     ):
 
-        if image_path and os.path.exists(image_path):
+        if get_image_source(image_path):
             st.image(
-                image_path,
+                get_image_source(image_path),
                 use_container_width=True,
             )
         else:
@@ -1073,135 +912,42 @@ def render_wishlist_card(item):
 # BACKGROUND SETTINGS
 # --------------------------------------------------
 
-def create_background_settings_table():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS background_settings (
-            page_name TEXT PRIMARY KEY,
-            image_path TEXT
-        )
-        """
-    )
-
-    connection.commit()
-    connection.close()
-
-
 def save_page_background(page_name, image_path):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO background_settings (page_name, image_path)
-        VALUES (?, ?)
-        ON CONFLICT(page_name)
-        DO UPDATE SET image_path = excluded.image_path
-        """,
-        (page_name, image_path),
-    )
-
-    connection.commit()
-    connection.close()
+    supabase.table("background_settings").upsert(
+        {
+            "user_id": current_user_id(),
+            "page_name": page_name,
+            "image_path": image_path,
+        },
+        on_conflict="user_id,page_name",
+    ).execute()
 
 
 def get_page_background(page_name):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT image_path
-        FROM background_settings
-        WHERE page_name = ?
-        """,
-        (page_name,),
+    rows = _rows(
+        supabase.table("background_settings")
+        .select("image_path")
+        .eq("user_id", current_user_id())
+        .eq("page_name", page_name)
+        .limit(1)
+        .execute()
     )
-
-    result = cursor.fetchone()
-
-    connection.close()
-
-    if result:
-        return result[0]
-
-    return None
+    return rows[0].get("image_path") if rows else None
 
 
 def remove_page_background(page_name):
     image_path = get_page_background(page_name)
-
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        DELETE FROM background_settings
-        WHERE page_name = ?
-        """,
-        (page_name,),
-    )
-
-    connection.commit()
-    connection.close()
-
-    if image_path and os.path.exists(image_path):
-        os.remove(image_path)
-
-# --------------------------------------------------
-# BACKGROUND IMAGE HELPERS
-# --------------------------------------------------
-
-def save_background_image(uploaded_file, page_name):
-    if uploaded_file is None:
-        return None
-
-    extension = uploaded_file.name.split(".")[-1].lower()
-
-    safe_page_name = (
-        page_name.lower()
-        .replace(" ", "_")
-        .replace("🏠", "")
-        .replace("➕", "")
-        .replace("👚", "")
-        .replace("👗", "")
-        .replace("📌", "")
-        .replace("📅", "")
-        .replace("❤️", "")
-        .replace("🎨", "")
-        .strip("_")
-    )
-
-    file_name = (
-        f"{safe_page_name}_{uuid.uuid4().hex}.{extension}"
-    )
-
-    image_path = BACKGROUND_FOLDER / file_name
-
-    with open(image_path, "wb") as image_file:
-        image_file.write(uploaded_file.getbuffer())
-
-    return str(image_path)
+    supabase.table("background_settings").delete().eq(
+        "user_id", current_user_id()
+    ).eq("page_name", page_name).execute()
+    _delete_storage_file(image_path)
 
 
 def apply_page_background(page_name):
     image_path = get_page_background(page_name)
-
-    if not image_path or not os.path.exists(image_path):
+    image_url = get_image_source(image_path)
+    if not image_url:
         return
-
-    with open(image_path, "rb") as image_file:
-        encoded_image = base64.b64encode(
-            image_file.read()
-        ).decode()
-
-    extension = image_path.split(".")[-1].lower()
-
-    if extension == "jpg":
-        extension = "jpeg"
 
     st.markdown(
         f"""
@@ -1212,14 +958,12 @@ def apply_page_background(page_name):
                     rgba(255, 255, 255, 0.08),
                     rgba(255, 255, 255, 0.08)
                 ),
-                url("data:image/{extension};base64,{encoded_image}");
-
+                url("{image_url}");
             background-size: cover;
             background-position: center;
             background-repeat: no-repeat;
             background-attachment: fixed;
         }}
-
         .block-container {{
             max-width: 1250px;
             padding-top: 2rem;
@@ -1230,85 +974,6 @@ def apply_page_background(page_name):
         unsafe_allow_html=True,
     )
 
-
-create_clothing_table()
-create_inspiration_table()
-create_background_settings_table()
-create_outfits_table()
-create_outfit_calendar_table()
-create_wishlist_table()
-
-def add_outfit_to_calendar(
-    outfit_id,
-    wear_date,
-    event_name,
-    notes
-):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO outfit_calendar (
-            outfit_id,
-            wear_date,
-            event_name,
-            notes
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            outfit_id,
-            wear_date,
-            event_name,
-            notes,
-        )
-    )
-
-    connection.commit()
-    connection.close()
-
-def get_calendar_outfits():
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            outfit_calendar.id,
-            outfit_calendar.wear_date,
-            outfit_calendar.event_name,
-            outfit_calendar.notes,
-            outfits.id,
-            outfits.outfit_name,
-            outfits.occasion
-        FROM outfit_calendar
-        JOIN outfits
-            ON outfit_calendar.outfit_id = outfits.id
-        ORDER BY outfit_calendar.wear_date ASC
-        """
-    )
-
-    calendar_outfits = cursor.fetchall()
-
-    connection.close()
-
-    return calendar_outfits
-
-def delete_calendar_outfit(calendar_id):
-    connection = connect_to_database()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        DELETE FROM outfit_calendar
-        WHERE id = ?
-        """,
-        (calendar_id,)
-    )
-
-    connection.commit()
-    connection.close()
 
 # --------------------------------------------------
 # DASHBOARD HELPERS
@@ -1463,8 +1128,21 @@ with st.sidebar:
         key="sidebar_navigation",
     )
 
-    st.divider()
     st.caption("Step into your style.")
+
+    st.divider()
+
+    user = st.session_state["user"]
+    st.caption(f"Signed in as {user.email}")
+
+    if st.button(
+        "Log Out",
+        key="sidebar_logout_button",
+        use_container_width=True,
+    ):
+        supabase.auth.sign_out()
+        st.session_state.pop("user", None)
+        st.rerun()
 
 apply_page_background(page)
 
@@ -1564,9 +1242,9 @@ if page == "Dashboard":
                         )
                         for index, item in enumerate(outfit_items[:3]):
                             with outfit_image_columns[index]:
-                                if item[6] and os.path.exists(item[6]):
+                                if get_image_source(item[6]):
                                     st.image(
-                                        item[6],
+                                        get_image_source(item[6]),
                                         use_container_width=True,
                                     )
 
@@ -1727,9 +1405,9 @@ if page == "Dashboard":
                     with st.container(
                         key=f"inspiration-card-dashboard-{pin_id}"
                     ):
-                        if image_path and os.path.exists(image_path):
+                        if get_image_source(image_path):
                             st.image(
-                                image_path,
+                                get_image_source(image_path),
                                 use_container_width=True,
                             )
                         else:
@@ -2432,13 +2110,10 @@ elif page == "Outfit Builder":
                                 category = item[2]
                                 photo_path = item[6]
 
-                                if (
-                                    photo_path
-                                    and os.path.exists(photo_path)
-                                ):
+                                if get_image_source(photo_path):
 
                                     st.image(
-                                        photo_path,
+                                        get_image_source(photo_path),
                                         use_container_width=True,
                                     )
 
@@ -2598,13 +2273,10 @@ elif page == "Inspiration":
 
                     with st.container(key = f"inspiration-card-{pin_id}"):
 
-                        if (
-                            image_path
-                            and os.path.exists(image_path)
-                        ):
+                        if get_image_source(image_path):
 
                             st.image(
-                                image_path,
+                                get_image_source(image_path),
                                 use_container_width=True,
                             )
 
@@ -2896,13 +2568,10 @@ elif page == "Outfit Calendar":
                                     category = item[2]
                                     image_path = item[6]
 
-                                    if (
-                                        image_path
-                                        and os.path.exists(image_path)
-                                    ):
+                                    if get_image_source(image_path):
 
                                         st.image(
-                                            image_path,
+                                            get_image_source(image_path),
                                             use_container_width=True,
                                         )
 
@@ -3462,15 +3131,12 @@ elif page == "Closet Reno":
         selected_page
     )
 
-    if (
-        current_background
-        and os.path.exists(current_background)
-    ):
+    if get_image_source(current_background):
 
         st.caption("Current wallpaper")
 
         st.image(
-            current_background,
+            get_image_source(current_background),
             use_container_width=True,
         )
 
@@ -3526,13 +3192,8 @@ elif page == "Closet Reno":
                 selected_page,
                 new_background,
             )
-
-            if (
-                old_background
-                and old_background != new_background
-                and os.path.exists(old_background)
-            ):
-                os.remove(old_background)
+            if old_background and old_background != new_background:
+                _delete_storage_file(old_background)
 
             st.success(
                 f"{selected_page} has been renovated!"

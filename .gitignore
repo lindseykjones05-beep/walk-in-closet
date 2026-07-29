@@ -1,11 +1,23 @@
-__pycache__/
-*.pyc
-.DS_Store
+# Secrets
 .streamlit/secrets.toml
 
-# Personal wardrobe data
+# Local database
 closet.db
+*.db
+
+# Local image folders
 images/
 inspiration_images/
 wishlist_images/
 background_images/
+
+# Backup files
+old_app.py
+app_before_supabase.py
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
