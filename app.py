@@ -541,6 +541,26 @@ def get_clothing_items():
         row.get("season"), int(bool(row.get("favorite"))), row.get("photo_path")
     ) for row in rows]
 
+def delete_clothing_item(item_id):
+    user_id = current_user_id()
+
+    # Remove the item from any saved outfits first
+    supabase.table("outfit_items").delete().eq(
+        "clothing_id",
+        item_id
+    ).eq(
+        "user_id",
+        user_id
+    ).execute()
+
+    # Delete the clothing item
+    supabase.table("clothing").delete().eq(
+        "id",
+        item_id
+    ).eq(
+        "user_id",
+        user_id
+    ).execute()
 
 def add_inspiration_pin(title, board_name, notes, image_path):
     supabase.table("inspiration").insert({
@@ -819,12 +839,6 @@ def render_clothing_card(item, location="closet"):
                 f"### {item_name}"
             )
 
-        with heart_column:
-            if favorite:
-                st.markdown(
-                    "<h3 style='text-align:right;'>♡</h3>",
-                    unsafe_allow_html=True,
-                )
 
         st.caption(category)
 
@@ -838,6 +852,56 @@ def render_clothing_card(item, location="closet"):
 
         if details:
             st.write(" • ".join(details))
+        if location == "closet":
+            delete_state_key = f"confirm_delete_clothing_{item_id}"
+
+            if st.session_state.get(delete_state_key, False):
+                st.warning(
+                    f"Delete {item_name}? This cannot be undone."
+                )
+
+                confirm_column, cancel_column = st.columns(2)
+
+                with confirm_column:
+                    if st.button(
+                        "Yes, Delete",
+                        key=f"confirm_delete_button_{item_id}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            delete_clothing_item(item_id)
+                            st.session_state.pop(
+                                delete_state_key,
+                                None,
+                            )
+                            st.success(f"{item_name} was deleted.")
+                            st.rerun()
+
+                        except Exception as error:
+                            st.error(
+                                f"The item could not be deleted: {error}"
+                            )
+
+                with cancel_column:
+                    if st.button(
+                        "Cancel",
+                        key=f"cancel_delete_button_{item_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pop(
+                            delete_state_key,
+                            None,
+                        )
+                        st.rerun()
+
+            else:
+                if st.button(
+                    "🗑️ Delete Item",
+                    key=f"delete_clothing_button_{item_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state[delete_state_key] = True
+                    st.rerun()
 
 def render_wishlist_card(item):
     wishlist_id = item[0]
